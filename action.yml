@@ -77,82 +77,105 @@ runs:
 
     - name: Update GitHub release notes with image metadata
       id: update-release
+      if: ${{ inputs.update-release == 'true' }}
       shell: bash
       continue-on-error: true
       env:
-        UPDATE_RELEASE: ${{ inputs.update-release }}
         TAG_NAME: ${{ inputs.tag-name }}
         DIGEST: ${{ inputs.digest }}
         IMAGE_NAME: ${{ inputs.image-name }}
         PUBLISHING_REPO: ${{ inputs.publishing-repo }}
         ATTESTATION_OUTCOME: ${{ steps.attest.outcome }}
+        ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
         GH_TOKEN: ${{ github.token }}
       run: |
-        if [ "${UPDATE_RELEASE}" != "true" ]; then
-          echo "Release notes update is disabled (update-release=false)"
-          exit 0
-        fi
+        set -euo pipefail
 
-        IMMUTABLE_REF="${IMAGE_NAME}@${DIGEST}"
+        WORK_DIR="$(mktemp -d)"
+        trap 'rm -rf "$WORK_DIR"' EXIT
+        export WORK_DIR
 
-        # Fetch the current release body
-        RELEASE_BODY=$(gh release view "${TAG_NAME}" \
+        if ! gh release view "${TAG_NAME}" \
           --repo "${PUBLISHING_REPO}" \
-          --json body \
-          --jq '.body // ""')
-
-        if [ -z "${RELEASE_BODY}" ]; then
-          echo "Warning: Release '${TAG_NAME}' does not exist or has no body in ${PUBLISHING_REPO}"
-          exit 0
+          --json body > "${WORK_DIR}/release.json"; then
+          echo "::warning::Unable to retrieve release; notes were not updated."
+          exit 1
         fi
 
-        # Create the new Docker Image Provenance section with explicit delimiters
-        read -r -d '' NEW_SECTION << 'SECTION_EOF' || true
-<!-- docker-image-provenance:start -->
-## Docker Image Provenance
+        python3 <<'PYTHON_EOF'
+        import json
+        import os
+        import re
+        from pathlib import Path
 
-**Image Reference:** `${IMMUTABLE_REF}`
+        work_dir = Path(os.environ["WORK_DIR"])
+        release = json.loads(
+            (work_dir / "release.json").read_text(encoding="utf-8")
+        )
+        body = release.get("body") or ""
 
-**Digest:** `${DIGEST}`
-SECTION_EOF
+        image = os.environ["IMAGE_NAME"]
+        digest = os.environ["DIGEST"]
+        outcome = os.environ["ATTESTATION_OUTCOME"]
+        url = os.environ.get("ATTESTATION_URL", "")
 
-        if [ "${ATTESTATION_OUTCOME}" = "success" ]; then
-          NEW_SECTION="${NEW_SECTION}
+        start = "<!-- docker-image-provenance:start -->"
+        end = "<!-- docker-image-provenance:end -->"
 
-**Attestation Status:** ✓ Signed provenance available
-<!-- docker-image-provenance:end -->"
-        else
-          NEW_SECTION="${NEW_SECTION}
+        lines = [
+            start,
+            "## Docker Image Provenance",
+            "",
+            f"**Image Reference:** `{image}@{digest}`",
+            "",
+            f"**Digest:** `{digest}`",
+            "",
+        ]
 
-**Attestation Status:** ⚠ Attestation was not completed for this release
-<!-- docker-image-provenance:end -->"
-        fi
+        if outcome == "success":
+            lines.append(
+                "**Attestation Status:** Signed provenance available"
+            )
+            if url:
+                lines.extend(["", f"[View attestation]({url})"])
+        else:
+            lines.append(
+                "**Attestation Status:** Attestation was not completed "
+                "for this image"
+            )
 
-        # Replace or insert the section using Python for robust handling
-        UPDATED_BODY=$(python3 << 'PYTHON_EOF'
-import sys
-import re
+        lines.append(end)
+        new_section = "\n".join(lines)
 
-body = """$RELEASE_BODY"""
-new_section = """$NEW_SECTION"""
+        if body.count(start) != body.count(end) or body.count(start) > 1:
+            raise SystemExit(
+                "Unexpected provenance markers; refusing to modify notes."
+            )
 
-# Try to find and replace existing section
-pattern = r'<!-- docker-image-provenance:start -->.*?<!-- docker-image-provenance:end -->\n?'
-if re.search(pattern, body, re.DOTALL):
-    # Replace existing section
-    updated = re.sub(pattern, new_section + '\n', body, count=1, flags=re.DOTALL)
-else:
-    # Prepend new section
-    updated = new_section + '\n\n' + body
+        if start in body:
+            pattern = re.escape(start) + r".*?" + re.escape(end)
+            updated, count = re.subn(
+                pattern,
+                lambda match: new_section,
+                body,
+                count=1,
+                flags=re.DOTALL,
+            )
+            if count != 1:
+                raise SystemExit(
+                    "Invalid provenance marker order; notes unchanged."
+                )
+        elif body:
+            updated = new_section + "\n\n" + body
+        else:
+            updated = new_section + "\n"
 
-print(updated, end='')
-PYTHON_EOF
-)
+        (work_dir / "updated-notes.md").write_text(
+            updated,
+            encoding="utf-8",
+        )
+        PYTHON_EOF
 
-        # Update the release using gh CLI with explicit auth
         gh release edit "${TAG_NAME}" \
           --repo "${PUBLISHING_REPO}" \
-          --notes "${UPDATED_BODY}" || {
-          echo "Warning: Failed to update release notes for ${TAG_NAME}"
-          exit 0
-        }
+          --notes-file "${WORK_DIR}/updated-notes.md"
