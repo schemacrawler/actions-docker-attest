@@ -1,0 +1,147 @@
+name: Docker Image Attestation
+description: Create Docker image provenance attestations, publish digests to step summary, and optionally update release notes
+author: Schemacrawler
+inputs:
+  image-name:
+    description: Fully qualified Docker image name (e.g., index.docker.io/schemacrawler/schemacrawler)
+    required: true
+  digest:
+    description: Multi-platform image digest output from a push operation
+    required: true
+  publishing-repo:
+    description: GitHub repository path where attestations are published (e.g., schemacrawler/SchemaCrawler)
+    required: true
+  tag-name:
+    description: GitHub release tag name for release notes updates
+    required: true
+  update-release:
+    description: Boolean indicating whether to update GitHub release notes (true/false)
+    required: true
+outputs:
+  image-digest:
+    description: The image digest value
+    value: ${{ steps.attest.outputs.digest }}
+  immutable-ref:
+    description: The full immutable image reference (image@digest)
+    value: ${{ steps.publish-summary.outputs.immutable-ref }}
+  attestation-outcome:
+    description: The outcome of the attestation step (success/failure)
+    value: ${{ steps.attest.outputs.attestation-outcome }}
+runs:
+  using: composite
+  steps:
+    - name: Create Docker image attestation
+      id: attest
+      shell: bash
+      continue-on-error: true
+      env:
+        DIGEST: ${{ inputs.digest }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        PUBLISHING_REPO: ${{ inputs.publishing-repo }}
+      run: |
+        set -e
+        
+        # Call actions/attest with pinned SHA
+        gh attestation create "${DIGEST}" \
+          --predicate-type slsaprovenance \
+          --predicate '{"builder":{"id":"https://github.com/actions/attest"}}' \
+          --repo "${PUBLISHING_REPO}" || {
+          echo "attestation-outcome=failure" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+        
+        echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "attestation-outcome=success" >> "$GITHUB_OUTPUT"
+    
+    - name: Publish digest and attestation status to step summary
+      id: publish-summary
+      shell: bash
+      env:
+        DIGEST: ${{ inputs.digest }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        PUBLISHING_REPO: ${{ inputs.publishing-repo }}
+        ATTESTATION_OUTCOME: ${{ steps.attest.outputs.attestation-outcome }}
+      run: |
+        set -e
+        
+        IMMUTABLE_REF="${IMAGE_NAME}@${DIGEST}"
+        
+        {
+          echo "## Docker Image Attestation"
+          echo ""
+          echo "**Image Digest:** \`${DIGEST}\`"
+          echo ""
+          echo "**Immutable Reference:** \`${IMMUTABLE_REF}\`"
+          echo ""
+          if [ "${ATTESTATION_OUTCOME}" = "success" ]; then
+            echo "**Attestation Status:** ✓ Success"
+            echo ""
+            echo "[View attestations](https://github.com/${PUBLISHING_REPO}/attestations)"
+          else
+            echo "**Attestation Status:** ✗ Failed"
+          fi
+          echo ""
+        } >> "$GITHUB_STEP_SUMMARY"
+        
+        echo "immutable-ref=${IMMUTABLE_REF}" >> "$GITHUB_OUTPUT"
+    
+    - name: Update GitHub release notes with image metadata
+      id: update-release
+      shell: bash
+      continue-on-error: true
+      env:
+        UPDATE_RELEASE: ${{ inputs.update-release }}
+        TAG_NAME: ${{ inputs.tag-name }}
+        DIGEST: ${{ inputs.digest }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        PUBLISHING_REPO: ${{ inputs.publishing-repo }}
+      run: |
+        set -e
+        
+        if [ "${UPDATE_RELEASE}" != "true" ]; then
+          echo "Release notes update is disabled (update-release=false)"
+          exit 0
+        fi
+        
+        IMMUTABLE_REF="${IMAGE_NAME}@${DIGEST}"
+        
+        # Get current release notes
+        RELEASE_NOTES=$(gh release view "${TAG_NAME}" \
+          --repo "${PUBLISHING_REPO}" \
+          --json body \
+          --jq .body 2>/dev/null || echo "")
+        
+        if [ -z "$RELEASE_NOTES" ]; then
+          echo "Warning: Release '${TAG_NAME}' does not exist in ${PUBLISHING_REPO}"
+          exit 0
+        fi
+        
+        # Create the new Docker Image Provenance section
+        PROVENANCE_SECTION="## Docker Image Provenance
+
+**Image Reference:** \`${IMMUTABLE_REF}\`
+
+**Digest:** \`${DIGEST}\`
+
+[View attestations](https://github.com/${PUBLISHING_REPO}/attestations)"
+        
+        # Use sed to replace or insert the section idempotently
+        if echo "$RELEASE_NOTES" | grep -q "## Docker Image Provenance"; then
+          # Section exists, replace it
+          UPDATED_NOTES=$(echo "$RELEASE_NOTES" | sed '/^## Docker Image Provenance$/,/^$/d' | sed "1i\\
+$PROVENANCE_SECTION
+" | sed '/^$/N;/^\n$/!P;D')
+        else
+          # Section doesn't exist, prepend it
+          UPDATED_NOTES="${PROVENANCE_SECTION}
+
+${RELEASE_NOTES}"
+        fi
+        
+        # Update the release using gh CLI
+        gh release edit "${TAG_NAME}" \
+          --repo "${PUBLISHING_REPO}" \
+          --notes "${UPDATED_NOTES}" || {
+          echo "Warning: Failed to update release notes for ${TAG_NAME}"
+          exit 0
+        }
