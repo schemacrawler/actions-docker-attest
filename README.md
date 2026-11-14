@@ -4,11 +4,11 @@
 
 ## About
 
-A reusable GitHub Action that creates Docker image provenance attestations, publishes immutable image references to workflow summaries, and optionally updates GitHub release notes with image metadata.
+A reusable GitHub Action that creates Docker image provenance attestations using `actions/attest`, publishes immutable image references to workflow summaries, and optionally updates GitHub release notes with image metadata.
 
 ## Overview
 
-This action encapsulates Docker image attestation and digest publishing logic, centralizing what would otherwise be duplicated across multiple workflows. It leverages the `actions/attest` action to create SLSA provenance attestations and the GitHub CLI to manage release notes.
+This action encapsulates Docker image attestation and digest publishing logic, centralizing what would otherwise be duplicated across multiple workflows. It uses the official `actions/attest` action to create SLSA provenance attestations and the GitHub CLI to manage release notes.
 
 ### Features
 
@@ -16,8 +16,9 @@ This action encapsulates Docker image attestation and digest publishing logic, c
 - 📋 Publishes image digests and attestation status to GitHub Actions step summaries
 - 🔗 Generates immutable image references (image@digest) for verification
 - 📝 Optionally updates GitHub release notes with image metadata
-- 🔄 Idempotent release notes updates (safe to rerun without duplication)
+- 🔄 Idempotent release notes updates with explicit delimiters (safe to rerun without duplication)
 - ⚠️ Graceful error handling (attestation failures don't block the workflow)
+- 🔐 Proper permission handling and authentication
 
 ## Inputs
 
@@ -25,7 +26,7 @@ This action encapsulates Docker image attestation and digest publishing logic, c
 |-------|----------|-------------|
 | `image-name` | Yes | Fully qualified Docker image name (e.g., `index.docker.io/schemacrawler/schemacrawler`) |
 | `digest` | Yes | Multi-platform image digest output from a push operation |
-| `publishing-repo` | Yes | GitHub repository path where attestations are published (e.g., `schemacrawler/SchemaCrawler`) |
+| `publishing-repo` | Yes | GitHub repository path for release notes updates (e.g., `schemacrawler/SchemaCrawler`) |
 | `tag-name` | Yes | GitHub release tag name for release notes updates |
 | `update-release` | Yes | Boolean indicating whether to update GitHub release notes (`true` or `false`) |
 
@@ -33,34 +34,57 @@ This action encapsulates Docker image attestation and digest publishing logic, c
 
 | Output | Description |
 |--------|-------------|
-| `image-digest` | The image digest value |
+| `image-digest` | The image digest value (always available) |
 | `immutable-ref` | The full immutable image reference (format: `image@digest`) |
 | `attestation-outcome` | The outcome of the attestation step (`success` or `failure`) |
+| `attestation-url` | URL to the published attestation (if successful) |
 
 ## Permissions
 
-The calling workflow must include the following permissions:
+The **calling workflow job** must declare these permissions:
 
 ```yaml
 permissions:
-  id-token: write        # Required by actions/attest
-  contents: write        # Required for release notes updates
+  id-token: write        # Required for OIDC token used by actions/attest
   attestations: write    # Required for attestation creation
+  contents: write        # Required for release notes updates
 ```
+
+**Important:** These permissions must be declared in the job that calls this action, not in the action metadata itself. GitHub Actions requires explicit permission declarations in workflows.
+
+If you omit a permission:
+- Missing `attestations: write` → attestation step fails (continues with `outcome: failure`)
+- Missing `contents: write` → release notes update fails (continues with warning)
+- Missing `id-token: write` → attestation cannot authenticate (continues with `outcome: failure`)
 
 ## Usage Examples
 
 ### Basic usage with attestation and release notes update
 
 ```yaml
-- name: Attest Docker image
-  uses: schemacrawler/actions-docker-attest@v1
-  with:
-    image-name: index.docker.io/schemacrawler/schemacrawler
-    digest: ${{ steps.build.outputs.digest }}
-    publishing-repo: schemacrawler/SchemaCrawler
-    tag-name: ${{ github.ref_name }}
-    update-release: true
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      contents: write
+    steps:
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: index.docker.io/schemacrawler/schemacrawler:${{ github.ref_name }}
+
+      - name: Attest Docker image
+        uses: schemacrawler/actions-docker-attest@v1
+        with:
+          image-name: index.docker.io/schemacrawler/schemacrawler
+          digest: ${{ steps.build.outputs.digest }}
+          publishing-repo: schemacrawler/SchemaCrawler
+          tag-name: ${{ github.ref_name }}
+          update-release: true
 ```
 
 ### Attestation only (no release notes update)
@@ -89,10 +113,14 @@ permissions:
     tag-name: ${{ github.ref_name }}
     update-release: true
 
-- name: Notify on attestation outcome
+- name: Report attestation
   run: |
     echo "Image: ${{ steps.attest.outputs.immutable-ref }}"
+    echo "Digest: ${{ steps.attest.outputs.image-digest }}"
     echo "Status: ${{ steps.attest.outputs.attestation-outcome }}"
+    if [ "${{ steps.attest.outputs.attestation-outcome }}" = "success" ]; then
+      echo "URL: ${{ steps.attest.outputs.attestation-url }}"
+    fi
 ```
 
 ### Complete workflow example
@@ -117,6 +145,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Build and push Docker image
         id: build
         uses: docker/build-push-action@v5
@@ -124,7 +161,7 @@ jobs:
           push: true
           tags: index.docker.io/schemacrawler/schemacrawler:${{ github.ref_name }}
 
-      - name: Attest Docker image
+      - name: Attest Docker image and update release notes
         uses: schemacrawler/actions-docker-attest@v1
         with:
           image-name: index.docker.io/schemacrawler/schemacrawler
@@ -138,63 +175,98 @@ jobs:
 
 ### Step 1: Create Attestation
 
-The action calls `actions/attest` with a pinned SHA to create a provenance attestation for the Docker image. This attestation is published to the GitHub Actions attestations store and can be verified using the `gh attestation verify` command.
+The action invokes `actions/attest` (version 4) to create a SLSA provenance attestation for the Docker image.
 
-If attestation fails (due to permission issues or platform errors), the action continues with a recorded failure status rather than failing the entire workflow.
+**Key points:**
+- The attestation is published to the repository where the workflow runs
+- The `publishing-repo` input does **not** control where attestations are published (that's determined by the workflow's repository)
+- `publishing-repo` only affects release notes updates
+- If attestation fails (permission issue, transient error), the action continues with `outcome: failure`
 
 ### Step 2: Publish to Step Summary
 
-The action publishes the following information to the GitHub Actions step summary:
-- Image digest
-- Immutable image reference (image@digest)
-- Attestation status (success or failure)
-- Link to view attestations (if successful)
+The action publishes to the GitHub Actions step summary:
+- Image digest (immutable reference)
+- Attestation status and outcome
+- Link to attestation (if successful)
 
-This summary is displayed in the workflow run details and provides immediate visibility into the attestation outcome.
+This provides immediate, visible feedback in the workflow run UI.
 
 ### Step 3: Update Release Notes (Optional)
 
-When `update-release` is `true`, the action updates the GitHub release notes for the specified tag with a "Docker Image Provenance" section containing:
-- The immutable image reference
-- The image digest
-- A link to view attestations
+When `update-release: true`, the action updates the GitHub release specified by `tag-name` in the repository specified by `publishing-repo`.
 
-The update is idempotent: if the section already exists, it is replaced rather than duplicated. This allows safe reruns of the workflow without corrupting release notes.
+**Idempotency:**
+- Release notes section is delimited with HTML comments: `<!-- docker-image-provenance:start -->` and `<!-- docker-image-provenance:end -->`
+- On rerun, the section between delimiters is replaced in place
+- Python is used for robust text replacement (avoiding sed interpolation issues)
+- If release doesn't exist, a warning is logged and the workflow continues
+
+## Architecture Notes
+
+### Attestation Repository vs. Release Notes Repository
+
+- **Attestation location:** Determined by where the workflow runs. If workflow is in `schemacrawler/SchemaCrawler`, attestations are published there. The `publishing-repo` input cannot redirect this.
+- **Release notes location:** Specified by `publishing-repo` input. Can be a different repository from where the workflow runs.
+
+Example: A workflow in `schemacrawler/SchemaCrawler`:
+- Creates attestations in `schemacrawler/SchemaCrawler` (not configurable)
+- Updates release notes in `schemacrawler/SchemaCrawler` (via `publishing-repo` input)
+- Both happen to be the same in this case
+
+### Permissions and Authentication
+
+- `id-token: write` + `attestations: write` → required for `actions/attest`
+- `contents: write` + `GH_TOKEN` → required for `gh release edit`
+- The action uses `${{ github.token }}` (automatically available in workflows) for release note updates
+- No additional secrets are required
 
 ## Error Handling
 
-The action is designed to be resilient:
+The action is designed to fail gracefully:
 
-- **Attestation failure**: Recorded as a failure outcome, but the workflow continues. This handles transient issues and permission problems.
-- **Release not found**: A warning is logged, but the workflow continues. This is common during initial tag creation.
-- **Missing permissions**: Individual steps fail gracefully. If `contents: write` is missing, release notes updates are skipped; if `attestations: write` is missing, attestation is skipped.
+| Issue | Behavior |
+|-------|----------|
+| Attestation fails | Recorded as `outcome: failure`; workflow continues |
+| Release doesn't exist | Warning logged; workflow continues |
+| Release notes update fails | Warning logged; workflow continues |
+| Missing `attestations: write` permission | Attestation fails; workflow continues |
+| Missing `contents: write` permission | Release update fails; workflow continues |
+| Authentication error | Visible in logs; workflow continues |
+
+This design ensures that partial failures (e.g., release not created yet) don't block the overall release process.
 
 ## Troubleshooting
 
-### Attestation step fails with permission error
+### Attestation step shows `outcome: failure` but no error message
 
-**Issue:** The `update-release` step logs permission errors.
+**Cause:** Missing `attestations: write` permission.
 
-**Solution:** Ensure the workflow has the `attestations: write` permission in the `permissions` section.
+**Solution:** Add `attestations: write` to the job's `permissions` block.
 
 ### Release notes are not being updated
 
-**Issue:** The release notes section does not appear after the workflow runs.
+**Cause:** One or more of:
+- `update-release: false`
+- Missing `contents: write` permission
+- Release doesn't exist yet
+- `publishing-repo` is incorrect
 
-**Solution:** Check that:
-1. `update-release` is set to `true`
-2. The workflow has `contents: write` permission
-3. A GitHub release exists for the specified `tag-name`
+**Solution:** 
+1. Verify `update-release` is `true`
+2. Add `contents: write` to permissions
+3. Ensure release exists before this step runs
+4. Check `publishing-repo` matches the actual repository
 
-### Duplicate sections in release notes
+### Release notes section appears multiple times
 
-**Issue:** Multiple "Docker Image Provenance" sections appear after multiple workflow runs.
+**Cause:** Older implementation used `sed` without delimiters.
 
-**Solution:** This should not happen with the current implementation. If it does, manually edit the release notes to remove duplicates and ensure only one section remains at the top.
+**Solution:** Use the current version. If duplicates exist in your releases, manually edit them and remove extras.
 
 ## Contributing
 
-Contributions are welcome! Please follow the SchemaCrawler contribution guidelines when submitting pull requests.
+Contributions are welcome! Please follow the SchemaCrawler contribution guidelines.
 
 ## License
 
@@ -205,3 +277,4 @@ This action is licensed under the MIT License. See [LICENSE](./LICENSE) for deta
 - [SchemaCrawler Website](https://www.schemacrawler.com)
 - [GitHub Organization](https://github.com/schemacrawler)
 - [actions/attest Documentation](https://github.com/actions/attest)
+- [GitHub CLI Documentation](https://cli.github.com)
