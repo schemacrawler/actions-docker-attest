@@ -1,6 +1,8 @@
-# Docker Image Attestation Action
+# <img src="https://github.com/schemacrawler/SchemaCrawler-Usage/blob/98e442d9a957070d45e87109d5b32d7f17b62927/schemacrawler-website/src/site/resources/images/schemacrawler_logo.png?raw=true" height="100px" width="100px" valign="middle"/> SchemaCrawler Docker Image Attestation Action
 
-<img src="https://www.schemacrawler.com/images/schemacrawler_logo.png" height="100" />
+> **Note**: Please see the [SchemaCrawler website](https://www.schemacrawler.com/) for more details.
+
+## About
 
 A reusable GitHub Action that creates Docker image provenance attestations, publishes immutable image references to workflow summaries, and optionally updates GitHub release notes with image metadata.
 
