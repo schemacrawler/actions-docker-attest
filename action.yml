@@ -3,7 +3,7 @@ description: Create Docker image provenance attestations, publish digests to ste
 author: Schemacrawler
 inputs:
   image-name:
-    description: Fully qualified Docker image name (e.g., index.docker.io/schemacrawler/schemacrawler)
+    description: Registry-qualified Docker image name without a tag (e.g., docker.io/schemacrawler/schemacrawler)
     required: true
   digest:
     description: Multi-platform image digest output from a push operation
@@ -40,6 +40,8 @@ runs:
       with:
         subject-name: ${{ inputs.image-name }}
         subject-digest: ${{ inputs.digest }}
+        push-to-registry: true
+        create-storage-record: false
 
     - name: Publish digest and attestation status to step summary
       id: publish-summary

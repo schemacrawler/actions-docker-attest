@@ -4,7 +4,7 @@
 
 ## About
 
-A reusable GitHub Action that creates Docker image provenance attestations using `actions/attest`, publishes immutable image references to workflow summaries, and optionally updates GitHub release notes with image metadata.
+A reusable GitHub Action that creates Docker image provenance attestations using `actions/attest`, publishes them to GitHub and the image registry, publishes immutable image references to workflow summaries, and optionally updates GitHub release notes with image metadata.
 
 ## Overview
 
@@ -24,7 +24,7 @@ This action encapsulates Docker image attestation and digest publishing logic, c
 
 | Input | Required | Description |
 |-------|----------|-------------|
-| `image-name` | Yes | Fully qualified Docker image name (e.g., `index.docker.io/schemacrawler/schemacrawler`) |
+| `image-name` | Yes | Registry-qualified Docker image name without a tag or digest (e.g., `docker.io/schemacrawler/schemacrawler`) |
 | `digest` | Yes | Multi-platform image digest output from a push operation |
 | `publishing-repo` | Yes | GitHub repository path for release notes updates (e.g., `schemacrawler/SchemaCrawler`) |
 | `tag-name` | Yes | GitHub release tag name for release notes updates |
@@ -59,6 +59,12 @@ If you omit a permission:
 
 ## Usage Examples
 
+### Migrating to v2.0.0
+
+Version 2 always sets `push-to-registry: true`. Before calling this action, log in to the image registry with credentials that can push to the image repository. Use `docker.io` as the registry for Docker Hub (as recommended by `actions/attest`), not an unqualified image name or `index.docker.io`. Supply the final pushed image digest separately in `digest`.
+
+Artifact metadata storage records are disabled, so no additional `artifact-metadata: write` permission is required. Existing v1 attestations are not automatically copied to the registry.
+
 ### Basic usage with attestation and release notes update
 
 ```yaml
@@ -70,17 +76,23 @@ jobs:
       attestations: write
       contents: write
     steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Build and push Docker image
         id: build
         uses: docker/build-push-action@v5
         with:
           push: true
-          tags: index.docker.io/schemacrawler/schemacrawler:${{ github.ref_name }}
+          tags: docker.io/schemacrawler/schemacrawler:${{ github.ref_name }}
 
       - name: Attest Docker image
-        uses: schemacrawler/actions-docker-attest@v1
+        uses: schemacrawler/actions-docker-attest@v2.0.0
         with:
-          image-name: index.docker.io/schemacrawler/schemacrawler
+          image-name: docker.io/schemacrawler/schemacrawler
           digest: ${{ steps.build.outputs.digest }}
           publishing-repo: schemacrawler/SchemaCrawler
           tag-name: ${{ github.ref_name }}
@@ -91,9 +103,9 @@ jobs:
 
 ```yaml
 - name: Attest Docker image
-  uses: schemacrawler/actions-docker-attest@v1
+  uses: schemacrawler/actions-docker-attest@v2.0.0
   with:
-    image-name: index.docker.io/schemacrawler/schemacrawler
+    image-name: docker.io/schemacrawler/schemacrawler
     digest: ${{ steps.build.outputs.digest }}
     publishing-repo: schemacrawler/SchemaCrawler
     tag-name: ${{ github.ref_name }}
@@ -105,9 +117,9 @@ jobs:
 ```yaml
 - name: Attest Docker image
   id: attest
-  uses: schemacrawler/actions-docker-attest@v1
+  uses: schemacrawler/actions-docker-attest@v2.0.0
   with:
-    image-name: index.docker.io/schemacrawler/schemacrawler
+    image-name: docker.io/schemacrawler/schemacrawler
     digest: ${{ steps.build.outputs.digest }}
     publishing-repo: schemacrawler/SchemaCrawler
     tag-name: ${{ github.ref_name }}
@@ -159,12 +171,12 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           push: true
-          tags: index.docker.io/schemacrawler/schemacrawler:${{ github.ref_name }}
+          tags: docker.io/schemacrawler/schemacrawler:${{ github.ref_name }}
 
       - name: Attest Docker image and update release notes
-        uses: schemacrawler/actions-docker-attest@v1
+        uses: schemacrawler/actions-docker-attest@v2.0.0
         with:
-          image-name: index.docker.io/schemacrawler/schemacrawler
+          image-name: docker.io/schemacrawler/schemacrawler
           digest: ${{ steps.build.outputs.digest }}
           publishing-repo: schemacrawler/SchemaCrawler
           tag-name: ${{ github.ref_name }}
@@ -178,7 +190,9 @@ jobs:
 The action invokes `actions/attest` (version 4) to create a SLSA provenance attestation for the Docker image.
 
 **Key points:**
-- The attestation is published to the repository where the workflow runs
+- The attestation is published to the GitHub repository where the workflow runs and pushed to the image registry using the existing registry login
+- The subject must include the registry and image repository, without a tag; the digest identifies the exact image
+- Artifact metadata storage records are disabled
 - The `publishing-repo` input does **not** control where attestations are published (that's determined by the workflow's repository)
 - `publishing-repo` only affects release notes updates
 - If attestation fails (permission issue, transient error), the action continues with `outcome: failure`
@@ -219,7 +233,24 @@ Example: A workflow in `schemacrawler/SchemaCrawler`:
 - `id-token: write` + `attestations: write` → required for `actions/attest`
 - `contents: write` + `GH_TOKEN` → required for `gh release edit`
 - The action uses `${{ github.token }}` (automatically available in workflows) for release note updates
-- No additional secrets are required
+- Registry push credentials must already be configured, for example by `docker/login-action`; the action reuses that login
+
+### Verification
+
+Replace `<digest>` with the SHA-256 hex value from the workflow summary or release notes:
+
+```sh
+# Retrieve the attestation from GitHub
+gh attestation verify \
+  'oci://docker.io/schemacrawler/schemacrawler@sha256:<digest>' \
+  --repo schemacrawler/SchemaCrawler
+
+# Retrieve the attestation from Docker Hub
+gh attestation verify \
+  'oci://docker.io/schemacrawler/schemacrawler@sha256:<digest>' \
+  --repo schemacrawler/SchemaCrawler \
+  --bundle-from-oci
+```
 
 ## Error Handling
 
